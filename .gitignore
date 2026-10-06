@@ -1,0 +1,11 @@
+# Python / tooling
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# Machine-specific or downloadable
+calibration.json
+enable1.txt
+ocr_debug/
