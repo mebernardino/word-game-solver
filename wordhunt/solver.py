@@ -239,7 +239,8 @@ class Solver:
 
 
 class CandidateSet:
-    """The words currently on the board, minus ones already played or blocked."""
+    """The words currently on the board, minus ones excluded this game (mark_played)
+    or blocked (e.g. rejected in past games)."""
 
     def __init__(self, solver: Solver, blocked: Iterable[str] = ()):
         self.solver = solver

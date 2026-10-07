@@ -162,3 +162,64 @@ def test_rejections_skip_the_wait_once_timing_is_learned(tmp_path, monkeypatch):
     took = time.monotonic() - start
     assert not accepted
     assert took < delay  # was delay * 2 (full wait + second look)
+
+
+
+def _one_word_game(tmp_path, argv=()):
+    """A game positioned to play TONED (the best word), with a fake screen."""
+    screen = FakeScreen(BOARD)
+    dragger = RejectingDragger(screen)
+    args = build_parser().parse_args(
+        ["--countdown", "0", "--post-word-delay", "0", "--retry-delay", "0"] + list(argv))
+    log = RejectLog(str(tmp_path / "rejected.txt"))
+    game = Game(args, Solver(Trie.from_words(WORDS)), FakeReader(screen), dragger,
+                threading.Event(), threading.Event(), rejects=log)
+    game.board = Board.parse(BOARD)
+    game.cands.refresh(game.board)
+    return game, screen, dragger, log
+
+
+def _play_best(game):
+    """One turn of the main loop's bookkeeping, via run() limited to one word."""
+    game.args.max_words = game.words + 1
+    game.args.countdown = 0
+    game.initial_board = lambda: game.board  # keep the current board
+    game.run()
+
+
+def test_accepted_word_can_be_played_again(tmp_path, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda p="": "")
+    game, screen, dragger, log = _one_word_game(tmp_path)
+    _play_best(game)
+    assert dragger.played == ["TONED"]
+    assert "TONED" not in game.cands.played  # still eligible if it shows up again
+
+    # The board comes back around so TONED is there again: it's replayed.
+    screen.board = Board.parse(BOARD)
+    game.board = Board.parse(BOARD)
+    game.cands.refresh(game.board)
+    _play_best(game)
+    assert dragger.played == ["TONED", "TONED"]
+    assert game.words == 2
+
+
+def test_no_repeats_option(tmp_path, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda p="": "")
+    game, _, _, _ = _one_word_game(tmp_path, ["--no-repeats"])
+    _play_best(game)
+    assert "TONED" in game.cands.played
+
+
+def test_refused_repeat_is_not_recorded_and_stops_repeats(tmp_path, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda p="": "")
+    game, screen, dragger, log = _one_word_game(tmp_path)
+    _play_best(game)                       # TONED accepted
+    screen.board = Board.parse(BOARD)      # ...and back on the board
+    game.board = Board.parse(BOARD)
+    game.cands.refresh(game.board)
+    dragger.rejects = {"TONED"}            # but this game refuses repeats
+    _play_best(game)
+    assert dragger.played[:2] == ["TONED", "TONED"]
+    assert not game.repeats
+    assert "TONED" not in log.pending and "TONED" not in log.counts  # it's a real word
+    assert "TONED" in game.cands.played

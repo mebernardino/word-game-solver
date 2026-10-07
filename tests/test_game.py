@@ -65,7 +65,7 @@ def make_game(argv, screen, reader):
 def test_plays_valid_words_tracks_board_and_never_repeats(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda _="": "")  # accept the detected board
     screen = FakeScreen("CATS ODOG RENT SXQZ")
-    game = make_game(["--max-words", "12", "--full-reread-every", "4"], screen, FakeReader(screen))
+    game = make_game(["--max-words", "12", "--full-reread-every", "4", "--no-repeats"], screen, FakeReader(screen))
     game.run()
 
     assert 1 <= game.words <= 12

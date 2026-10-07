@@ -72,6 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--max-words", type=int, default=0, help="stop after N words (0 = no limit)")
     g.add_argument("--time-limit", type=float, default=0, help="stop after S seconds (0 = no limit)")
     g.add_argument("--dry-run", action="store_true", help="hover the path without pressing the mouse")
+    g.add_argument("--no-repeats", action="store_true",
+                   help="never play a word twice in one game (by default accepted words may be replayed)")
     return p
 
 
@@ -152,6 +154,10 @@ class Game:
         # readable (the latest seen this game). Once known, a word whose tiles
         # are still unchanged a bit after that was rejected: no need to wait longer.
         self.letters_appear: Optional[float] = None
+        self.accepted_words: set = set()
+        # Replaying accepted words is allowed until the game shows it doesn't
+        # accept repeats (or --no-repeats / --dry-run, where the board never changes).
+        self.repeats = not (args.no_repeats or args.dry_run)
 
     # ---- reading
 
@@ -325,15 +331,15 @@ class Game:
                     self.cands.refresh(self.board, changed=changed)
                     continue
             if pick is None:
-                print("No unplayed words left on this board.")
+                print("No playable words left on this board.")
                 break
 
             self.dragger.drag(pick.path)
             self.attempts += 1
-            self.cands.mark_played(pick.word)  # never tried again this game, accepted or not
             stats = f"path {fmt_path(pick.path):<24} [{elapsed:5.1f}s, solve {self.cands.last_solve_ms:.1f} ms]"
 
             if a.dry_run:
+                self.cands.mark_played(pick.word)
                 self.words += 1
                 self.total += pick.score
                 print(f"#{self.attempts:<3} {pick.word:<12} +{pick.score:<5} total {self.total:<6} {stats}")
@@ -349,7 +355,11 @@ class Game:
                 self.words += 1
                 self.total += pick.score
                 self.reject_streak = 0
-                print(f"#{self.attempts:<3} {pick.word:<12} +{pick.score:<5} total {self.total:<6} {stats}")
+                repeat = " (repeat)" if pick.word in self.accepted_words else ""
+                self.accepted_words.add(pick.word)
+                if not self.repeats:
+                    self.cands.mark_played(pick.word)
+                print(f"#{self.attempts:<3} {pick.word:<12} +{pick.score:<5} total {self.total:<6} {stats}{repeat}")
                 if self.rejects:
                     newly = self.rejects.confirm_pending()
                     if newly:
@@ -357,9 +367,19 @@ class Game:
             else:
                 self.rejected += 1
                 self.reject_streak += 1
-                print(f"#{self.attempts:<3} {pick.word:<12} rejected (not counted)")
-                if self.rejects:
-                    self.rejects.suspect(pick.word)
+                self.cands.mark_played(pick.word)  # don't retry it this game
+                if pick.word in self.accepted_words:
+                    # The game took this word before, so it's valid: it refused the
+                    # repeat. Don't record it, and stop replaying words this game.
+                    print(f"#{self.attempts:<3} {pick.word:<12} rejected as a repeat; "
+                          "no more repeats this game")
+                    self.repeats = False
+                    for word in self.accepted_words:
+                        self.cands.mark_played(word)
+                else:
+                    print(f"#{self.attempts:<3} {pick.word:<12} rejected (not counted)")
+                    if self.rejects:
+                        self.rejects.suspect(pick.word)
                 if self.reject_streak == self.REJECT_WARNING:
                     print(f"  ({self.reject_streak} words in a row didn't change the board. Is the game "
                           "window in front, and are the drags landing on the tiles?)")

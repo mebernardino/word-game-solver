@@ -86,6 +86,7 @@ stops it (pyautogui's fail-safe).
 | `--post-word-delay` | 0.58 | wait for the replacement animation before re-reading tiles |
 | `--countdown` | 3 | seconds to focus the game window |
 | `--max-words` / `--time-limit` | off | stop conditions |
+| `--no-repeats` | off | never replay a word in one game (by default accepted words may be played again; if the game refuses a repeat, repeats stop for that game) |
 | `--full-reread-every` | 1 | re-read the whole board every N words to correct misreads (1 = after every word) |
 | `--min-conf` | 60 | OCR confidence below which a tile is re-shot once; a tile that still reads blank is skipped and re-read after the next word |
 | `--rejected` / `--reject-after` | `rejected.txt` / 1 | where rejected words are saved / games before a word is skipped (0 = never) |
