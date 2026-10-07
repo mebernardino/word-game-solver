@@ -66,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("playing")
     g.add_argument("--segment-time", type=float, default=0.06, help="seconds per tile-to-tile move")
-    g.add_argument("--post-word-delay", type=float, default=0.51,
+    g.add_argument("--post-word-delay", type=float, default=0.58,
                    help="wait after a word for the tile-replacement animation (it takes ~0.62s)")
     g.add_argument("--countdown", type=int, default=3, help="seconds to focus the game window")
     g.add_argument("--max-words", type=int, default=0, help="stop after N words (0 = no limit)")

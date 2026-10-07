@@ -83,7 +83,7 @@ stops it (pyautogui's fail-safe).
 |---|---|---|
 | `--strategy` | `score` | `score`, `rate` (points per second of dragging), `keep-good-letters` |
 | `--segment-time` | 0.06 | seconds per tile-to-tile move |
-| `--post-word-delay` | 0.51 | wait for the replacement animation before re-reading tiles |
+| `--post-word-delay` | 0.58 | wait for the replacement animation before re-reading tiles |
 | `--countdown` | 3 | seconds to focus the game window |
 | `--max-words` / `--time-limit` | off | stop conditions |
 | `--full-reread-every` | 1 | re-read the whole board every N words to correct misreads (1 = after every word) |
