@@ -1,3 +1,4 @@
+import os
 import threading
 
 from test_game import WORDS, FakeReader, FakeScreen
@@ -76,7 +77,7 @@ def play(tmp_path, dragger_kw, argv=(), reader_cls=None, seed=0):
     dragger = RejectingDragger(screen, **dragger_kw)
     reader = reader_cls(screen, dragger) if reader_cls else FakeReader(screen)
     args = build_parser().parse_args(
-        ["--countdown", "0", "--post-word-delay", "0", "--retry-delay", "0", "--full-reread-every", "0"]
+        ["--countdown", "0", "--timing", os.devnull, "--post-word-delay", "0", "--retry-delay", "0", "--settle-max", "0.3"]
         + list(argv))
     log = RejectLog(str(tmp_path / "rejected.txt"), threshold=2)
     game = Game(args, Solver(Trie.from_words(WORDS)), reader, dragger,
@@ -106,7 +107,8 @@ def test_blocked_after_two_games(tmp_path, monkeypatch):
 
 def test_slow_animation_is_not_a_rejection(tmp_path, monkeypatch):
     monkeypatch.setattr("builtins.input", lambda p="": "")
-    game, _, log = play(tmp_path, {}, ["--max-words", "2"], reader_cls=SlowAnimationReader)
+    game, _, log = play(tmp_path, {}, ["--max-words", "2", "--post-word-delay", "0.1"],
+                        reader_cls=SlowAnimationReader)
     assert game.rejected == 0 and game.words == 2
     assert log.counts == {}
 
@@ -139,7 +141,7 @@ def test_rejections_skip_the_wait_once_timing_is_learned(tmp_path, monkeypatch):
     screen = FakeScreen(BOARD)
     dragger = RejectingDragger(screen, rejects=set(WORDS) - {"TONED"})
     args = build_parser().parse_args(
-        ["--countdown", "0", "--post-word-delay", str(delay), "--retry-delay", "0", "--max-words", "1"])
+        ["--countdown", "0", "--timing", os.devnull, "--post-word-delay", str(delay), "--retry-delay", "0", "--max-words", "1"])
     game = Game(args, Solver(Trie.from_words(WORDS)), FakeReader(screen), dragger,
                 threading.Event(), threading.Event())
 
@@ -150,7 +152,7 @@ def test_rejections_skip_the_wait_once_timing_is_learned(tmp_path, monkeypatch):
     game.attempts += 1
     changed, accepted = game.update_after_word(path, time.monotonic())
     assert accepted
-    assert game.letters_appear is not None and game.letters_appear < 0.1
+    assert game.anim_start is not None and game.anim_start < 0.1
     game.cands.mark_played("TONED")
     game.cands.refresh(game.board, changed=changed)
 
@@ -170,7 +172,7 @@ def _one_word_game(tmp_path, argv=()):
     screen = FakeScreen(BOARD)
     dragger = RejectingDragger(screen)
     args = build_parser().parse_args(
-        ["--countdown", "0", "--post-word-delay", "0", "--retry-delay", "0"] + list(argv))
+        ["--countdown", "0", "--timing", os.devnull, "--post-word-delay", "0", "--retry-delay", "0"] + list(argv))
     log = RejectLog(str(tmp_path / "rejected.txt"))
     game = Game(args, Solver(Trie.from_words(WORDS)), FakeReader(screen), dragger,
                 threading.Event(), threading.Event(), rejects=log)
@@ -223,3 +225,61 @@ def test_refused_repeat_is_not_recorded_and_stops_repeats(tmp_path, monkeypatch)
     assert not game.repeats
     assert "TONED" not in log.pending and "TONED" not in log.counts  # it's a real word
     assert "TONED" in game.cands.played
+
+
+def _timing_game(tmp_path, delay, rejects=(), timing=None):
+    screen = FakeScreen(BOARD)
+    dragger = RejectingDragger(screen, rejects=set(rejects))
+    args = build_parser().parse_args(
+        ["--countdown", "0", "--post-word-delay", str(delay), "--retry-delay", "0",
+         "--timing", str(timing or tmp_path / "timing.json")])
+    game = Game(args, Solver(Trie.from_words(WORDS)), FakeReader(screen), dragger,
+                threading.Event(), threading.Event())
+    game.board = Board.parse(BOARD)
+    game.cands.refresh(game.board)
+    return game, dragger
+
+
+def _time_word(game, dragger, word):
+    import time
+
+    path = game.cands.paths[word]
+    dragger.drag(path)
+    start = time.monotonic()
+    _, accepted = game.update_after_word(path, start)
+    return accepted, time.monotonic() - start
+
+
+def test_rejection_before_timing_is_learned_takes_one_delay(tmp_path):
+    delay = 0.3
+    game, dragger = _timing_game(tmp_path, delay, rejects={"TONED"})
+    accepted, took = _time_word(game, dragger, "TONED")
+    assert not accepted
+    assert took < delay * 1.5  # was ~2x the delay (full wait + a second look)
+
+
+def test_timing_is_remembered_between_games(tmp_path):
+    import json
+
+    timing = tmp_path / "timing.json"
+    game, dragger = _timing_game(tmp_path, 0.3, timing=timing)
+    accepted, _ = _time_word(game, dragger, "TONED")
+    assert accepted and json.loads(timing.read_text())["animation_start"] < 0.1
+
+    # A new game starts out knowing it, so its first rejection is already fast.
+    game2, dragger2 = _timing_game(tmp_path, 0.3, rejects={"TONED"}, timing=timing)
+    assert game2.anim_start is not None
+    accepted, took = _time_word(game2, dragger2, "TONED")
+    assert not accepted and took < 0.3
+
+
+def test_late_start_is_still_accepted(tmp_path):
+    """Safety net: if the watch judged a word rejected but the tiles change just
+    after, it still counts, and the board is read once the tiles land."""
+    game, dragger = _timing_game(tmp_path, 0.2)
+    path = game.cands.paths["TONED"]
+    dragger.drag(path)  # the screen now shows the refilled tiles
+    game.wait_for_animation = lambda used, released: (True, None)  # the watch said "rejected"
+    _, accepted = game.update_after_word(path)
+    assert accepted
+    assert game.board.letters == dragger.screen.board.letters

@@ -9,3 +9,4 @@ __pycache__/
 calibration.json
 enable1.txt
 ocr_debug/
+timing.json

@@ -31,9 +31,9 @@ this (the tiles still show the same letters after a second look), doesn't count 
 and moves on. Rejected words are saved in `rejected.txt` and skipped in every later game
 (use `--reject-after 2` to require two separate games first). A rejection is only saved once a later word in the same game
 is accepted, so a game where no drags register (e.g. the window lost focus) can't add words
-to it. Rejected words don't animate, so once the bot has seen how soon an accepted word's new
-letters appear, it calls a word rejected shortly after that point instead of waiting the full
-`--post-word-delay` and taking a second look. After 5 rejections in a row it prints a warning but keeps playing. Edit `rejected.txt` freely: delete a line to
+to it. Rejected words don't animate: on an accepted word the tiles start moving almost at
+once, so the bot learns how soon that happens (remembered between games in `timing.json`)
+and calls a word rejected if its tiles are still unchanged shortly after that. After 5 rejections in a row it prints a warning but keeps playing. Edit `rejected.txt` freely: delete a line to
 allow a word again, or add a word on its own line to skip it right away.
 
 ### macOS permissions
@@ -59,7 +59,7 @@ python -m wordhunt --dict enable1.txt --dry-run --max-words 5
 
 # 3. Play
 python -m wordhunt --dict enable1.txt --time-limit 80
-python -m wordhunt --dict enable1.txt --strategy rate --segment-time 0.05
+python -m wordhunt --dict enable1.txt --strategy rate
 python -m wordhunt --dict enable1.txt --manual   # type the letters yourself, no OCR
 ```
 
@@ -82,12 +82,14 @@ stops it (pyautogui's fail-safe).
 | flag | default | |
 |---|---|---|
 | `--strategy` | `score` | `score`, `rate` (points per second of dragging), `keep-good-letters` |
-| `--segment-time` | 0.06 | seconds per tile-to-tile move |
-| `--post-word-delay` | 0.58 | wait for the replacement animation before re-reading tiles |
+| `--segment-time` | 0.11 | seconds per tile-to-tile move |
+| `--press-time` / `--drag-steps` | 0.025 / 7 | hold at the first and last tile / mouse events per move; raise these if the game misses tiles |
+| `--post-word-delay` | 0.62 | wait for the replacement animation before re-reading tiles |
 | `--countdown` | 3 | seconds to focus the game window |
 | `--max-words` / `--time-limit` | off | stop conditions |
 | `--no-repeats` | off | never replay a word in one game (by default accepted words may be played again; if the game refuses a repeat, repeats stop for that game) |
-| `--full-reread-every` | 1 | re-read the whole board every N words to correct misreads (1 = after every word) |
+| `--timing` | `timing.json` | where the learned animation timing is remembered between games |
+| `--settle-max` | 1.0 | after the post-word delay, keep re-reading (up to this many seconds) until falling tiles have landed |
 | `--min-conf` | 60 | OCR confidence below which a tile is re-shot once; a tile that still reads blank is skipped and re-read after the next word |
 | `--rejected` / `--reject-after` | `rejected.txt` / 1 | where rejected words are saved / games before a word is skipped (0 = never) |
 | `--min-len` / `--scores` | 3 / `3:100,4:400,5:800,6:1400,7:1800,8:2200` | |

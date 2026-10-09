@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import threading
@@ -42,9 +43,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--manual", action="store_true", help="type letters instead of using OCR")
     g.add_argument("--min-conf", type=float, default=60, help="OCR confidence (0-100) below which a tile is re-shot once")
     g.add_argument("--retry-delay", type=float, default=0.25, help="wait before re-shooting an unclear tile")
-    g.add_argument("--full-reread-every", type=int, default=1, metavar="N",
-                   help="re-read the whole board every N words to correct misreads "
-                        "(default 1 = after every word; 0 = only the tiles each word used)")
+    g.add_argument("--timing", default="timing.json", metavar="PATH",
+                   help="where the learned animation timing is remembered between games")
+    g.add_argument("--settle-max", type=float, default=1.0, metavar="S",
+                   help="after the post-word delay, keep re-reading up to S seconds until tiles stop moving")
     g.add_argument("--rejected", default="rejected.txt", metavar="PATH",
                    help="file of words the game rejected; skipped in later games")
     g.add_argument("--reject-after", type=int, default=1, metavar="N",
@@ -65,8 +67,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="keep-good-letters: consider words within this fraction of the top score")
 
     g = p.add_argument_group("playing")
-    g.add_argument("--segment-time", type=float, default=0.06, help="seconds per tile-to-tile move")
-    g.add_argument("--post-word-delay", type=float, default=0.58,
+    g.add_argument("--segment-time", type=float, default=0.11, help="seconds per tile-to-tile move")
+    g.add_argument("--press-time", type=float, default=0.025,
+                   help="seconds to hold at the first and last tile so the game registers them")
+    g.add_argument("--drag-steps", type=int, default=7,
+                   help="mouse events per tile-to-tile move (more = smoother but slower)")
+    g.add_argument("--post-word-delay", type=float, default=0.62,
                    help="wait after a word for the tile-replacement animation (it takes ~0.62s)")
     g.add_argument("--countdown", type=int, default=3, help="seconds to focus the game window")
     g.add_argument("--max-words", type=int, default=0, help="stop after N words (0 = no limit)")
@@ -119,6 +125,23 @@ def type_board() -> Board:
             print("  Need exactly 16 tiles.")
 
 
+def load_anim_start(path: str) -> Optional[float]:
+    """How soon after a word tiles start moving, as learned in earlier games."""
+    try:
+        with open(path) as f:
+            return float(json.load(f)["animation_start"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def save_anim_start(path: str, seconds: float) -> None:
+    try:
+        with open(path, "w") as f:
+            json.dump({"animation_start": round(seconds, 3)}, f)
+    except OSError:
+        pass
+
+
 def fmt_path(path) -> str:
     return " ".join(f"{r + 1}{c + 1}" for r, c in path)
 
@@ -132,8 +155,9 @@ def sleep_unless(event: threading.Event, seconds: float) -> bool:
 
 class Game:
     REJECT_WARNING = 5  # warn (once per streak) after this many rejections in a row
-    POLL_INTERVAL = 0.05  # seconds between looks at a word's tiles while waiting
-    REJECT_MARGIN = 0.15  # extra wait past the latest "new letters appeared" time seen
+    POLL_INTERVAL = 0.03  # seconds between looks at a word's tiles while waiting
+    REJECT_MARGIN = 0.12  # extra wait past the latest "tiles started moving" time seen
+    SETTLE_GAP = 0.03     # seconds between board reads while waiting for tiles to land
 
     def __init__(self, args, solver: Solver, reader, dragger, abort, pause, rejects=None):
         self.args = args
@@ -150,10 +174,11 @@ class Game:
         self.rejected = 0
         self.reject_streak = 0
         self.total = 0
-        # Seconds after release at which an accepted word's new letters became
-        # readable (the latest seen this game). Once known, a word whose tiles
-        # are still unchanged a bit after that was rejected: no need to wait longer.
-        self.letters_appear: Optional[float] = None
+        # Seconds after release at which an accepted word's tiles first visibly
+        # changed (the latest seen). Once known, a word whose tiles still show
+        # their old letters a bit after that was rejected: no need to wait longer.
+        # Remembered between games in --timing.
+        self.anim_start: Optional[float] = load_anim_start(args.timing)
         self.accepted_words: set = set()
         # Replaying accepted words is allowed until the game shows it doesn't
         # accept repeats (or --no-repeats / --dry-run, where the board never changes).
@@ -205,78 +230,114 @@ class Game:
                 print(f"  Learned {added} new letter template(s).")
 
     def wait_for_animation(self, used: List[Cell], released: float) -> Tuple[bool, Optional[float]]:
-        """Wait out the tile-replacement animation, watching the word's tiles.
+        """Wait out the --post-word-delay, watching the word's tiles.
 
-        Returns (rejected early, seconds after release when new letters showed).
-        Accepted words always get the full --post-word-delay. A rejected word
-        has no animation, so once we've learned when new letters normally show
-        up, unchanged tiles past that point mean "rejected" and we stop waiting.
+        Returns (rejected, seconds after release when the tiles first changed).
+        On an accepted word the tiles vanish almost at once. So a word is
+        rejected if its tiles still show their old letters a little after the
+        latest start time seen on accepted words, or if they never changed at
+        all during the whole delay.
         """
         before = {c: self.board[c] for c in used}
         done = released + self.args.post_word_delay
-        give_up = (released + self.letters_appear + self.REJECT_MARGIN
-                   if self.letters_appear is not None else None)
+        give_up = released + self.anim_start + self.REJECT_MARGIN if self.anim_start is not None else None
         while time.monotonic() < done:
-            reads = self.reader.read_cells(used)
-            # A different readable letter = the new tiles. ("?" doesn't count: it can be a
-            # highlight or a mid-animation frame, and proves nothing either way.)
-            if any(reads[c].letter not in (UNKNOWN, before[c]) for c in used):
-                appeared = time.monotonic() - released
-                sleep_unless(self.abort, done - time.monotonic())  # let the animation finish
-                return False, appeared
+            reads = {c: r.letter for c, r in self.reader.read_cells(used).items()}
+            if reads != before:  # a tile vanished, moved, or changed: animation under way
+                started = time.monotonic() - released
+                sleep_unless(self.abort, done - time.monotonic())
+                return False, started
             if give_up is not None and time.monotonic() >= give_up:
                 return True, None
             if sleep_unless(self.abort, min(self.POLL_INTERVAL, max(0.0, done - time.monotonic()))):
                 break
-        return False, None
+        return True, None  # nothing moved during the whole delay
+
+    def read_settled(self, deadline: float) -> Dict[Cell, str]:
+        """Read the whole board until it has stopped moving.
+
+        In this game used tiles disappear and the tiles above drop down their
+        column, so some can still be falling when the delay ends: a read then
+        sees an empty spot ("?") or a tile part-way down. The board counts as
+        settled when two reads in a row agree and there are no more "?" than
+        before the word. Gives up at the deadline and returns the last read.
+        """
+        cells = [(r, c) for r in range(SIZE) for c in range(SIZE)]
+        allowed_unknown = len(self.board.unknown_cells())
+
+        def read():
+            return {c: r.letter for c, r in self.reader.read_cells(cells).items()}
+
+        prev = read()
+        while time.monotonic() < deadline:
+            if sleep_unless(self.abort, self.SETTLE_GAP):
+                break
+            cur = read()
+            if cur == prev and list(cur.values()).count(UNKNOWN) <= allowed_unknown:
+                return cur
+            prev = cur
+        return prev
+
+    @staticmethod
+    def falling_zone(used: Iterable[Cell]) -> List[Cell]:
+        """Tiles expected to change after a word: in each column the word used,
+        every tile from the top down to its lowest used tile (they drop down)."""
+        lowest: Dict[int, int] = {}
+        for r, c in used:
+            lowest[c] = max(lowest.get(c, -1), r)
+        return [(r, c) for c, bottom in lowest.items() for r in range(bottom + 1)]
 
     def update_after_word(self, path, released: Optional[float] = None) -> Tuple[List[Cell], bool]:
-        """Re-read the tiles that were just replaced (or the whole board, periodically).
+        """Wait for the board to settle after a word, then re-read all of it.
 
         Returns (cells whose letters may have changed, whether the game accepted
-        the word). An accepted word's tiles get new letters; if they all still
-        show the same letters after a second look, the game rejected it.
+        the word). If nothing where the word was has changed, it was rejected.
         """
         used = list(dict.fromkeys(path))
-        # Also retry any tiles we couldn't read earlier.
-        unknown = [c for c in self.board.unknown_cells() if c not in used]
         if self.reader is None:
-            s = input(f"  New letters for tiles {fmt_path(used)} in that order (Enter = word rejected): ")
-            typed = any(ch.isalpha() for ch in s)
+            print("  Type the new board, or press Enter if the word was rejected.")
+            s = input("  ").strip()
+            if not s:
+                return used, False
             try:
-                for cell, tile in zip(used, split_tiles(s, len(used))):
-                    self.board[cell] = tile
+                new = Board.parse(s)
             except ValueError:
-                if typed:
-                    print("  Wrong count; opening the board editor.")
-                    self.board = edit_board(self.board)
-            return used, typed
+                new = edit_board(self.board)
+            changed = self.board.diff(new)
+            self.board = new
+            return changed, True
 
-        rejected_early, appeared = self.wait_for_animation(
-            used, time.monotonic() if released is None else released)
+        released = time.monotonic() if released is None else released
+        rejected, started = self.wait_for_animation(used, released)
+        zone = self.falling_zone(used)
+        everything = [(r, c) for r in range(SIZE) for c in range(SIZE)]
+        if rejected:
+            letters = {c: r.letter for c, r in self.reader.read_cells(everything).items()}
+            if any(letters[c] != self.board[c] for c in zone):
+                # Safety net: it moved after all (a late start). Treat as accepted.
+                letters = self.read_settled(time.monotonic() + self.args.post_word_delay
+                                            + self.args.settle_max)
+        else:
+            letters = self.read_settled(released + self.args.post_word_delay + self.args.settle_max)
+        accepted = any(letters[c] != self.board[c] for c in zone)
+        if accepted and started is not None and (self.anim_start is None or started > self.anim_start):
+            self.anim_start = started
+            save_anim_start(self.args.timing, started)
 
-        every = self.args.full_reread_every
-        full = bool(every) and self.attempts % every == 0
-        cells = [(r, c) for r in range(SIZE) for c in range(SIZE)] if full else used + unknown
-        letters = self.read_cells(cells)
-        if not rejected_early and all(letters[c] == self.board[c] for c in used):
-            # Maybe the replacement animation hadn't finished: look once more.
-            time.sleep(max(self.args.post_word_delay, self.args.retry_delay))
-            letters.update(self.read_cells(used))
-        accepted = not all(letters[c] == self.board[c] for c in used)
-        if accepted and appeared is not None:
-            self.letters_appear = max(self.letters_appear or 0.0, appeared)
-
-        # Tiles the word didn't touch shouldn't change; if they read differently
-        # now, an earlier read was wrong (or still animating) and this corrects it.
-        fixed = [c for c in cells if c not in used and c not in unknown and letters[c] != self.board[c]]
+        # Tiles outside the falling zone shouldn't change; if they read differently
+        # now, an earlier read was wrong and this corrects it.
+        fixed = [c for c in letters if c not in zone and letters[c] != self.board[c]
+                 and self.board[c] != UNKNOWN]
         if fixed:
             print(f"  Re-read corrected {len(fixed)} tile(s): "
                   + ", ".join(f"{fmt_path([c])} {self.board[c].capitalize()}->{letters[c].capitalize()}"
                               for c in fixed))
+        blank = [c for c in letters if letters[c] == UNKNOWN]
+        if blank:
+            print(f"  couldn't read tile(s) {fmt_path(blank)}; avoiding them for now")
+        changed = sorted(set(zone) | {c for c in letters if letters[c] != self.board[c]})
         for cell, tile in letters.items():
             self.board[cell] = tile
-        changed = used + unknown + fixed
         return changed, accepted
 
     # ---- loop
@@ -446,7 +507,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         reader = TileReader(calib, scales.coord_scale, args.tesseract_cmd, args.save_tiles,
                             matcher=default_matcher(args.glyphs, args.font),
                             glyph_dir=None if args.no_learn else args.glyphs)
-    dragger = Dragger(calib.centers, args.segment_time, dry_run=args.dry_run, abort=abort)
+    dragger = Dragger(calib.centers, args.segment_time, args.press_time, args.drag_steps,
+                      dry_run=args.dry_run, abort=abort)
     if args.dry_run:
         print("DRY RUN: the mouse will hover over each word without clicking.")
 

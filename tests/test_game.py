@@ -1,3 +1,4 @@
+import os
 """Run the real play loop against a simulated game (no screen, mouse or OCR)."""
 import random
 import threading
@@ -57,7 +58,8 @@ class FakeDragger:
 
 
 def make_game(argv, screen, reader):
-    args = build_parser().parse_args(["--countdown", "0", "--post-word-delay", "0", "--retry-delay", "0"] + argv)
+    args = build_parser().parse_args(
+        ["--countdown", "0", "--timing", os.devnull, "--post-word-delay", "0", "--retry-delay", "0", "--settle-max", "0.3"] + argv)
     solver = Solver(Trie.from_words(WORDS))
     return Game(args, solver, reader, FakeDragger(screen), threading.Event(), threading.Event())
 
@@ -65,7 +67,7 @@ def make_game(argv, screen, reader):
 def test_plays_valid_words_tracks_board_and_never_repeats(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda _="": "")  # accept the detected board
     screen = FakeScreen("CATS ODOG RENT SXQZ")
-    game = make_game(["--max-words", "12", "--full-reread-every", "4", "--no-repeats"], screen, FakeReader(screen))
+    game = make_game(["--max-words", "12", "--no-repeats"], screen, FakeReader(screen))
     game.run()
 
     assert 1 <= game.words <= 12
@@ -121,3 +123,70 @@ def test_misread_is_corrected_after_next_word(monkeypatch, capsys):
     game.run()
     assert game.board[(3, 3)] == "Z"
     assert "Re-read corrected 1 tile(s): 44 K->Z" in capsys.readouterr().out
+
+
+
+# ------------------------------------------------------------------ falling tiles
+
+class GravityScreen(FakeScreen):
+    """Like the real game: used tiles vanish, tiles above drop down their column,
+    new letters fill in at the top. For a few reads afterwards, the tiles that
+    moved are still falling: they read as "?" (empty spot) or the wrong letter."""
+
+    def __init__(self, letters, falling_reads=3, seed=0):
+        super().__init__(letters, seed)
+        self.falling_reads = 0
+        self.moving = set()
+        self.falling_frames = falling_reads
+
+    def apply_word(self, path):
+        used = set(path)
+        for c in range(4):
+            keep = [self.board[(r, c)] for r in range(4) if (r, c) not in used]
+            new = [self.rng.choice("EEAOTNRDSCG") for _ in range(4 - len(keep))]
+            column = new + keep
+            for r in range(4):
+                if self.board[(r, c)] != column[r]:
+                    self.moving.add((r, c))
+                self.board[(r, c)] = column[r]
+        self.falling_reads = self.falling_frames
+
+
+class GravityReader(FakeReader):
+    def read_cells(self, cells):
+        out = super().read_cells(cells)
+        if self.screen.falling_reads and len(cells) == 16:
+            self.screen.falling_reads -= 1
+            for i, cell in enumerate(sorted(self.screen.moving)):
+                out[cell] = TileRead("?" if i % 2 else "X", 90)  # empty spot / tile mid-fall
+            if not self.screen.falling_reads:
+                self.screen.moving = set()
+        return out
+
+
+class GravityDragger(FakeDragger):
+    def drag(self, path):
+        spelled = "".join(self.screen.board.tile_text(r * 4 + c) for r, c in path)
+        self.screen.drags.append(spelled)
+        self.screen.paths.append(path)
+        self.screen.apply_word(path)
+
+
+def test_waits_for_falling_tiles_to_land(monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda p="": "")
+    screen = GravityScreen("CATS ODOG RENT SXQZ")
+    args = build_parser().parse_args(
+        ["--countdown", "0", "--timing", os.devnull, "--post-word-delay", "0", "--retry-delay", "0", "--max-words", "3"])
+    game = Game(args, Solver(Trie.from_words(WORDS)), GravityReader(screen), GravityDragger(screen),
+                threading.Event(), threading.Event())
+    game.run()
+    out = capsys.readouterr().out
+    assert game.words >= 2 and game.rejected == 0
+    assert game.board.letters == screen.board.letters   # read after everything landed
+    assert "corrected" not in out                      # falling tiles aren't "misreads"
+    assert all(w in WORDS for w in screen.drags)
+
+
+def test_falling_zone():
+    zone = Game.falling_zone([(2, 1), (3, 1), (1, 2)])
+    assert sorted(zone) == [(0, 1), (0, 2), (1, 1), (1, 2), (2, 1), (3, 1)]
